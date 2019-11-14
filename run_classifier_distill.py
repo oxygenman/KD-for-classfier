@@ -19,10 +19,7 @@ parser = argparse.ArgumentParser()
 LookupChoices = type('', (argparse.Action, ), dict(__call__=lambda a, p, n, v, o: setattr(n, a.dest, a.choices[v])))
 ###@xy###
 parser.add_argument('--dataset',
-                    choices=dict(cub200=dataset.CUB2011Metric,
-                                 cars196=dataset.Cars196Metric,
-                                 stanford=dataset.StanfordOnlineProductsMetric,
-                                 cifar100=cifar100,
+                    choices=dict(cifar100=cifar100,
                                  imagenet=imagenet,
                                  dog=dataset.DogsDataset
                                  ),
@@ -30,19 +27,15 @@ parser.add_argument('--dataset',
                     action=LookupChoices)
 
 parser.add_argument('--base',
-                    choices=dict(googlenet=backbone.GoogleNet,
-                                 inception_v1bn=backbone.InceptionV1BN,
-                                 resnet18=backbone.ResNet18,
+                    choices=dict(resnet18=backbone.ResNet18,
                                  resnet50=backbone.ResNet50,
+                                 shufflenetv2=backbone.shufflenetv2,
                                  renet18_cifar=backbone.ResNet18_cifar),
                     default=backbone.ResNet18_cifar,
                     action=LookupChoices)
 
 parser.add_argument('--teacher_base',
-                    choices=dict(googlenet=backbone.GoogleNet,
-                                 inception_v1bn=backbone.InceptionV1BN,
-                                 shufflenet_v2=backbone.ShuffleNet,
-                                 resnet18=backbone.ResNet18,
+                    choices=dict(resnet18=backbone.ResNet18,
                                  resnet50=backbone.ResNet50,
                                  resnet152=backbone.ResNet152,
                                  resnet50_cifar=backbone.ResNet50_cifar),
@@ -99,57 +92,37 @@ opts = parser.parse_args(['--dataset','dog','--base','resnet18','--embedding','T
                           '--nst_ratio','0','--dark_ratio','0',
                          '--lr','0.001', '--hkd_ratio', '50','--at_ratio','0','--batch','128', '--epochs','200',
                           '--save_dir', 'dog_student_resnet50_resnet18'])
-#argument setting for imagenet
-#opts = parser.parse_args(['--dataset','imagenet','--base', 'resnet18','--embedding','False','extract_feature_mode',
-#                          'True', '--teacher_base','resnet152','--teacher_load','path to resnet152.pth',
-#                          '--dist_ratio','20', '--angle_ratio','50','--ground_truth_ratio','1',
-#                          '--save_dir','imagenet_student_resnet18'])
-
 student_base = opts.base()
 teacher_base = opts.teacher_base()
 
 
 def get_normalize(net):
-    google_mean = torch.Tensor([104, 117, 128]).view(1, -1, 1, 1).cuda()
-    google_std = torch.Tensor([1, 1, 1]).view(1, -1, 1, 1).cuda()
-    other_mean = torch.Tensor([0.485, 0.456, 0.406]).view(1, -1, 1, 1).cuda()
-    other_std = torch.Tensor([0.229, 0.224, 0.225]).view(1, -1, 1, 1).cuda()
-
-    def googlenorm(x):
-        x = x[:, [2, 1, 0]] * 255
-        x = (x - google_mean) / google_std
+    # you can add Customized normalize with different type of your net model
+    mean = torch.Tensor([0.485, 0.456, 0.406]).view(1, -1, 1, 1).cuda()
+    std = torch.Tensor([0.229, 0.224, 0.225]).view(1, -1, 1, 1).cuda()
+    def norm(x):
+        x = (x - mean) / std
         return x
-
-    def othernorm(x):
-        x = (x - other_mean) / other_std
-        return x
-
-    if isinstance(net, backbone.InceptionV1BN) or isinstance(net, backbone.GoogleNet):
-        return googlenorm
-    else:
-        return othernorm
+    return norm
 
 
 teacher_normalize = get_normalize(teacher_base)
 student_normalize = get_normalize(student_base)
 ###@xy###
+#you may need to modify these transforms with your dataset
 train_transform = transforms.Compose([
     transforms.Resize((256, 256)),
     transforms.RandomCrop(224),
-    #transforms.Pad(4),
-    #transforms.RandomCrop(32),
     transforms.RandomHorizontalFlip(),
     transforms.ToTensor(),
 ])
-
-###@xy###
 test_transform = transforms.Compose([
     transforms.Resize((256, 256)),
     transforms.CenterCrop(224),
     transforms.ToTensor(),
 ])
 
-dataset_train = opts.dataset(opts.data, train=True, transform=train_transform, download=False)
+dataset_train = opts.dataset(opts.data, train=True, transform=train_transform, download=True)
 dataset_train_eval = opts.dataset(opts.data, train=False, transform=test_transform, download=False)
 dataset_eval = opts.dataset(opts.data, train=False, transform=test_transform, download=False)
 
@@ -162,6 +135,7 @@ loader_train_eval = DataLoader(dataset_train_eval, shuffle=False, batch_size=opt
                                pin_memory=False, num_workers=8)
 loader_eval = DataLoader(dataset_eval, shuffle=False, batch_size=opts.batch, drop_last=False,
                                pin_memory=True, num_workers=8)
+#based on based_model,add a embeding layer to adapt your class number
 if opts.embedding:
     print('student embedding')
     student = LinearEmbedding(student_base,
@@ -181,7 +155,7 @@ if opts.teacher_embedding:
                           embedding_size=opts.teacher_embedding_size,
                           normalize=opts.teacher_l2normalize == 'true')
 else: teacher=teacher_base
-
+# only train the embedding layer
 if opts.extract_feature_mode:
     for param in student.parameters()[:-1]:
         param.requires_grad = False
@@ -215,7 +189,6 @@ def train(loader, ep):
     ground_loss_all=[]
     nst_loss_all=[]
 
-
     train_iter = tqdm(loader)
     for images, labels in train_iter:
         images, labels = images.cuda(), labels.cuda()
@@ -223,14 +196,9 @@ def train(loader, ep):
         with torch.no_grad():
             t_b1, t_b2, t_b3, t_b4, pool, t_e = teacher(teacher_normalize(images), True)
 
-        if isinstance(student.base, backbone.GoogleNet):
-            assert (opts.at_ratio == 0), "AttentionTransfer cannot be applied on GoogleNet at current implementation."
-            e = student(student_normalize(images))
-            at_loss = torch.zeros(1, device=e.device)
-        else:
-            b1, b2, b3, b4, pool, e = student(student_normalize(images), True)
-            at_loss = opts.at_ratio * (at_criterion(b2, t_b2) + at_criterion(b3, t_b3) + at_criterion(b4, t_b4))
-            nst_loss=opts.nst_ratio * (nst_criterion(b2,t_b2) + nst_criterion(b3, t_b3) + nst_criterion(b4, t_b4))
+        b1, b2, b3, b4, pool, e = student(student_normalize(images), True)
+        at_loss = opts.at_ratio * (at_criterion(b2, t_b2) + at_criterion(b3, t_b3) + at_criterion(b4, t_b4))
+        nst_loss=opts.nst_ratio * (nst_criterion(b2,t_b2) + nst_criterion(b3, t_b3) + nst_criterion(b4, t_b4))
 ###@xy###
         dist_loss = opts.dist_ratio * dist_criterion(e, t_e)
         angle_loss = opts.angle_ratio * angle_criterion(e, t_e)
@@ -256,7 +224,6 @@ def train(loader, ep):
            torch.Tensor(at_loss_all).mean(), torch.Tensor(hkd_loss_all).mean(), torch.Tensor(nst_loss_all).mean(),
            torch.Tensor(ground_loss_all).mean()
            ))
-
 ###@xy###
 def eval(net, normalize,loader, ep):
     net.eval()
